@@ -1,3 +1,6 @@
 *.old
 *.old_none
 /tmp/
+__pycache__/
+*.pyc
+*.pyo
