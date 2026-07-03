@@ -8,23 +8,47 @@ set -euo pipefail
 # Usage: detect-profile.sh <exe_or_lnk_path>
 # Output: JSON to stdout
 
-input_path="${1:?Usage: detect-profile.sh <exe_or_lnk_path>}"
+# ---- Helpers ----
+json_error() {
+  local msg="$1"
+  local hint="${2:-}"
+  if [ -n "$hint" ]; then
+    echo "{\"status\":\"error\",\"error\":\"$msg\",\"hint\":\"$hint\"}"
+  else
+    echo "{\"status\":\"error\",\"error\":\"$msg\"}"
+  fi
+}
+
+json_escape() {
+  # JSON-escape a string read from stdin.
+  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()), end="")'
+}
+
+# ---- Argument validation ----
+if [ $# -lt 1 ]; then
+  json_error "Usage: detect-profile.sh <exe_or_lnk_path>"
+  exit 1
+fi
+
+input_path="$1"
+
+if [ ! -e "$input_path" ]; then
+  json_error "File not found: $input_path" "Provide a path to a Windows .exe or .lnk file"
+  exit 1
+fi
+
 input_path="$(realpath "$input_path")"
 
 # ---- Resolve .lnk to target exe ----
 if file -b "$input_path" | grep -Eqi 'MS windows shortcut'; then
-  # Try to extract LocalBasePath from .lnk binary
-  local_base_path=$(strings "$input_path" | grep -E '^[A-Z]:\\' | head -1)
-  if [ -n "$local_base_path" ]; then
-    echo "{\"warning\":\"Input is a .lnk pointing to $local_base_path\",\"lnk_target\":\"$local_base_path\"}" >&2
-  fi
-  echo "{\"error\":\"Input is a .lnk shortcut. Resolve the actual .exe path first.\",\"lnk_target\":\"$local_base_path\"}" >&2
+  local_base_path=$(strings "$input_path" 2>/dev/null | grep -E '^[A-Z]:\\' | head -1 || true)
+  printf '{"status":"error","error":"Input is a .lnk shortcut. Resolve the actual .exe path first.","lnk_target":%s}\n' "$(echo "$local_base_path" | json_escape)"
   exit 1
 fi
 
 # ---- Validate it's a PE ----
 if ! file -b "$input_path" | grep -Eqi 'PE32|PE32+'; then
-  echo "{\"error\":\"Not a Windows PE executable: $input_path\"}"
+  json_error "Not a Windows PE executable: $input_path" "Provide a Windows .exe file"
   exit 1
 fi
 
@@ -39,8 +63,18 @@ if file -b "$input_path" | grep -qi 'x86-64'; then
 fi
 
 # ---- PE metadata (ProductName, FileDescription) ----
-version_script="$(dirname "$(realpath "$0")")/pe_read_version.py"
-app_name=$(python3 "$version_script" "$input_path" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('app_name',''))" 2>/dev/null || true)
+warnings=()
+app_name=""
+if command -v python3 &>/dev/null; then
+  version_script="$(dirname "$(realpath "$0")")/pe_read_version.py"
+  version_result=$(python3 "$version_script" "$input_path" 2>&1) || {
+    warnings+=("pe_read_version.py failed: $(echo "$version_result" | head -1)")
+  }
+  app_name=$(echo "$version_result" | python3 -c "import json,sys;print(json.load(sys.stdin).get('app_name',''))" 2>/dev/null || true)
+else
+  warnings+=("python3 not found; using filename as app name")
+fi
+
 # Fallback: use filename minus .exe as app name
 [ -z "$app_name" ] && app_name="$(echo "$exe_name" | sed 's/[^a-zA-Z0-9 ]//g')"
 [ -z "$app_name" ] && app_name="$exe_name"
@@ -95,10 +129,15 @@ fi
 
 # Check Vulkan availability
 vulkan_available=false
+vulkan_hint=""
 if command -v vulkaninfo &>/dev/null; then
   if vulkaninfo --summary 2>/dev/null | grep -qi 'GPU0'; then
     vulkan_available=true
+  else
+    vulkan_hint="vulkaninfo found but no GPU0 detected"
   fi
+else
+  vulkan_hint="Install vulkan-tools to verify Vulkan support"
 fi
 
 # ---- Icon availability ----
@@ -109,6 +148,8 @@ if command -v wrestool &>/dev/null; then
   if [ "$icon_count" -gt 0 ]; then
     has_icons=true
   fi
+else
+  warnings+=("wrestool not found; cannot verify icon availability")
 fi
 
 # ---- Generate Electron flags if applicable ----
@@ -119,21 +160,52 @@ if [ "$profile" = "electron" ]; then
   electron_flags+=("--disable-background-networking")
 fi
 
+# ---- Build arrays safely ----
+reasons_json="["
+first=true
+for r in "${reasons[@]}"; do
+  $first || reasons_json+=","
+  reasons_json+=$(echo "$r" | json_escape)
+  first=false
+done
+reasons_json+="]"
+
+warnings_json="["
+first=true
+for w in "${warnings[@]}"; do
+  $first || warnings_json+=","
+  warnings_json+=$(echo "$w" | json_escape)
+  first=false
+done
+warnings_json+="]"
+
+flags_json="["
+first=true
+for f in "${electron_flags[@]}"; do
+  $first || flags_json+=","
+  flags_json+=$(echo "$f" | json_escape)
+  first=false
+done
+flags_json+="]"
+
 # ---- Output JSON ----
 cat <<JSONEOF
 {
-  "app_name": "$app_name",
-  "exe_path": "$input_path",
-  "exe_dir": "$exe_dir",
+  "status": "ok",
+  "app_name": $(echo "$app_name" | json_escape),
+  "exe_path": $(echo "$input_path" | json_escape),
+  "exe_dir": $(echo "$exe_dir" | json_escape),
   "arch": "$arch",
   "profile": "$profile",
   "profile_confidence": "$confidence",
-  "profile_reasons": [$(printf '"%s",' "${reasons[@]}" | sed 's/,$//')],
-  "wine_prefix": "${WINEPREFIX:-$HOME/.wine}",
+  "profile_reasons": $reasons_json,
+  "wine_prefix": $(echo "${WINEPREFIX:-$HOME/.wine}" | json_escape),
   "dxvk_recommended": $dxvk_recommended,
   "vulkan_available": $vulkan_available,
+  "vulkan_hint": $(echo "$vulkan_hint" | json_escape),
   "has_icons": $has_icons,
   "icon_count": $icon_count,
-  "electron_flags": [$(printf '"%s",' "${electron_flags[@]}" | sed 's/,$//')]
+  "electron_flags": $flags_json,
+  "warnings": $warnings_json
 }
 JSONEOF
