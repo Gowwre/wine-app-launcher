@@ -5,7 +5,7 @@ set -euo pipefail
 # Thin shell wrapper around write_launcher.py.
 # Creates a shell launcher script and .desktop file for a Wine app.
 #
-# Usage: write-launcher.sh <config.json>
+# Usage: write-launcher.sh [--dry-run] <config.json>
 #   config JSON fields:
 #     - app_name: string (required)
 #     - exe_path: string (required)
@@ -19,16 +19,27 @@ set -euo pipefail
 #
 # Output: JSON
 
+dry_run=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run="--dry-run"; shift ;;
+    --) shift; break ;;
+    -*) echo '{"status":"error","error":"Unknown option: '"$1"'"}'; exit 1 ;;
+    *) break ;;
+  esac
+done
+
 if [ $# -lt 1 ]; then
-  echo '{"error":"Usage: write-launcher.sh <config.json>"}'
+  echo '{"status":"error","error":"Usage: write-launcher.sh [--dry-run] <config.json>"}'
   exit 1
 fi
 
 config_file="$1"
 if [ ! -f "$config_file" ]; then
-  echo "{\"error\":\"Config file not found: $config_file\"}"
+  echo "{\"status\":\"error\",\"error\":\"Config file not found: $config_file\"}"
   exit 1
 fi
 
 launcher_script="$(dirname "$(realpath "$0")")/write_launcher.py"
-exec python3 "$launcher_script" "$config_file"
+exec python3 "$launcher_script" $dry_run "$config_file"

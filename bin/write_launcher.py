@@ -2,10 +2,11 @@
 """
 Generate a Wine launcher script and .desktop entry from a JSON config.
 
-Usage: write_launcher.py <config.json>
+Usage: write_launcher.py [--dry-run] <config.json>
 Output: JSON describing the created files.
 """
 
+import argparse
 import json
 import os
 import pathlib
@@ -39,6 +40,13 @@ def _safe_name(app_name: str) -> str:
     return safe.replace(" ", "_")
 
 
+def _error(message: str, hint: str = "") -> str:
+    payload = {"status": "error", "error": message}
+    if hint:
+        payload["hint"] = hint
+    return json.dumps(payload)
+
+
 def read_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -47,8 +55,10 @@ def read_config(path: str) -> dict:
 def validate_config(cfg: dict) -> tuple[str, str]:
     app_name = cfg.get("app_name", "").strip()
     exe_path = cfg.get("exe_path", "").strip()
-    if not app_name or not exe_path:
-        raise ValueError("Config must include app_name and exe_path")
+    if not app_name:
+        raise ValueError("Config must include app_name")
+    if not exe_path:
+        raise ValueError("Config must include exe_path")
     return app_name, exe_path
 
 
@@ -64,7 +74,7 @@ def write_launcher_script(
     wine_prefix: str,
     flags: list[str],
     env_vars: dict,
-) -> None:
+) -> str:
     merged_env = dict(DEFAULT_ENV)
     for key, value in env_vars.items():
         merged_env[key.upper()] = value
@@ -83,8 +93,10 @@ def write_launcher_script(
     lines.append("")
     lines.append(f'exec wine {shlex.quote(exe_path)}{flags_str} "$@"')
 
-    script_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    content = "\n".join(lines) + "\n"
+    script_file.write_text(content, encoding="utf-8")
     script_file.chmod(0o755)
+    return content
 
 
 def write_desktop_file(
@@ -93,7 +105,7 @@ def write_desktop_file(
     script_file: pathlib.Path,
     icon_name: str,
     categories: str,
-) -> None:
+) -> str:
     content = "\n".join(
         [
             "[Desktop Entry]",
@@ -109,6 +121,7 @@ def write_desktop_file(
     )
     desktop_file.write_text(content, encoding="utf-8")
     desktop_file.chmod(0o755)
+    return content
 
 
 def create_desktop_shortcut(desktop_file: pathlib.Path, safe_name: str) -> pathlib.Path | None:
@@ -121,18 +134,28 @@ def create_desktop_shortcut(desktop_file: pathlib.Path, safe_name: str) -> pathl
         return None
 
 
-def rebuild_icon_cache() -> None:
+def rebuild_icon_cache() -> tuple[bool, str]:
     for cmd in ("kbuildsycoca6", "kbuildsycoca5"):
         try:
             subprocess.run([cmd], capture_output=True, timeout=10, check=False)
-            return
+            return True, cmd
         except Exception:
             pass
+    return False, ""
 
 
-def main(config_path: str) -> None:
-    cfg = read_config(config_path)
-    app_name, exe_path = validate_config(cfg)
+def main(config_path: str, dry_run: bool = False) -> None:
+    try:
+        cfg = read_config(config_path)
+    except json.JSONDecodeError as exc:
+        print(_error(f"Invalid JSON in config: {exc}", "Fix the config file syntax"))
+        sys.exit(1)
+
+    try:
+        app_name, exe_path = validate_config(cfg)
+    except ValueError as exc:
+        print(_error(str(exc), "Ensure app_name and exe_path are provided"))
+        sys.exit(1)
 
     wine_prefix = cfg.get("wine_prefix", os.path.expanduser("~/.wine"))
     profile = cfg.get("profile", "default")
@@ -146,47 +169,76 @@ def main(config_path: str) -> None:
 
     script_dir = pathlib.Path.home() / ".local" / "bin"
     desktop_dir = pathlib.Path.home() / ".local" / "share" / "applications"
-    script_dir.mkdir(parents=True, exist_ok=True)
-    desktop_dir.mkdir(parents=True, exist_ok=True)
-
     script_file = script_dir / f"{safe_name}.sh"
     desktop_file = desktop_dir / f"{safe_name}.desktop"
 
+    warnings = []
+    if not os.path.exists(exe_path):
+        warnings.append(f"exe_path does not exist on this filesystem: {exe_path}")
+
     flags = build_flags(profile, extra_flags)
+
+    if dry_run:
+        result = {
+            "status": "ok",
+            "state": "would_create",
+            "app_name": app_name,
+            "profile": profile,
+            "script": str(script_file),
+            "desktop": str(desktop_file),
+            "desktop_shortcut": desktop_shortcut,
+            "flags": flags,
+            "icon_name": icon_name,
+            "warnings": warnings,
+        }
+        print(json.dumps(result, indent=2))
+        return
+
+    script_dir.mkdir(parents=True, exist_ok=True)
+    desktop_dir.mkdir(parents=True, exist_ok=True)
+
     write_launcher_script(script_file, exe_path, wine_prefix, flags, env_vars)
     write_desktop_file(desktop_file, app_name, script_file, icon_name, categories)
 
     shortcut_path = None
     if desktop_shortcut:
         shortcut_path = create_desktop_shortcut(desktop_file, safe_name)
+        if shortcut_path is None:
+            warnings.append("Could not create desktop shortcut")
 
-    rebuild_icon_cache()
+    cache_updated, cache_cmd = rebuild_icon_cache()
+    if not cache_updated:
+        warnings.append("Could not rebuild icon cache (kbuildsycoca6/5 not found)")
 
     result = {
+        "status": "ok",
+        "state": "created",
         "app_name": app_name,
         "profile": profile,
         "script": str(script_file),
         "desktop": str(desktop_file),
         "desktop_shortcut": shortcut_path is not None,
+        "cache_updated": cache_updated,
+        "cache_command": cache_cmd,
         "flags": flags,
         "icon_name": icon_name,
+        "warnings": warnings,
     }
     print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: write_launcher.py <config.json>"}))
+    parser = argparse.ArgumentParser(description="Generate Wine launcher files from a JSON config")
+    parser.add_argument("config", help="Path to JSON config file")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be created without writing files")
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.config):
+        print(_error(f"Config file not found: {args.config}"))
         sys.exit(1)
 
     try:
-        main(sys.argv[1])
-    except FileNotFoundError as exc:
-        print(json.dumps({"error": f"Config file not found: {exc.filename}"}))
-        sys.exit(1)
-    except ValueError as exc:
-        print(json.dumps({"error": str(exc)}))
-        sys.exit(1)
+        main(args.config, dry_run=args.dry_run)
     except Exception as exc:
-        print(json.dumps({"error": f"Unexpected error: {exc}"}))
+        print(_error(f"Unexpected error: {exc}", "Check permissions and config values"))
         sys.exit(1)
