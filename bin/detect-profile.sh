@@ -39,49 +39,8 @@ if file -b "$input_path" | grep -qi 'x86-64'; then
 fi
 
 # ---- PE metadata (ProductName, FileDescription) ----
-app_name=""
-if command -v wrestool &>/dev/null; then
-  pe_raw=$(wrestool --raw --type=version "$input_path" 2>/dev/null)
-  if [ -n "$pe_raw" ]; then
-    # Parse VS_VERSION_INFO with Python (extracts StringFileInfo entries)
-    app_name=$(python3 -c "
-import struct, sys
-
-data = sys.stdin.buffer.read()
-
-def parse_string(data, offset):
-    """Read a UTF-16LE null-terminated string at offset."""
-    end = offset
-    while end + 2 <= len(data):
-        if data[end] == 0 and data[end+1] == 0:
-            break
-        end += 2
-    return data[offset:end].decode('utf-16-le', errors='replace')
-
-def find_key(data, key):
-    """Find a key in VS_VERSION_INFO StringFileInfo."""
-    key_bytes = key.encode('utf-16-le')
-    idx = 0
-    while True:
-        idx = data.find(key_bytes, idx)
-        if idx == -1:
-            break
-        val_start = idx + len(key_bytes)
-        if val_start < len(data) and (data[val_start] != 0 or data[val_start+1] != 0):
-            return parse_string(data, val_start)
-        idx += 2
-    return ''
-
-# Try FileDescription first, then ProductName
-for k in ['FileDescription', 'ProductName', 'OriginalFilename']:
-    v = find_key(data, k)
-    if v:
-        print(v)
-        sys.exit(0)
-print('')
-" <<< "$pe_raw" 2>/dev/null || true)
-  fi
-fi
+version_script="$(dirname "$(realpath "$0")")/pe_read_version.py"
+app_name=$(python3 "$version_script" "$input_path" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('app_name',''))" 2>/dev/null || true)
 # Fallback: use filename minus .exe as app name
 [ -z "$app_name" ] && app_name="$(echo "$exe_name" | sed 's/[^a-zA-Z0-9 ]//g')"
 [ -z "$app_name" ] && app_name="$exe_name"
